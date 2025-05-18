@@ -223,85 +223,89 @@ def sce(
     density: float = 1.0,
     majority_sign_method: Literal["total", "frequency"] = "total",
 ) -> torch.Tensor:
-    """
-    SCE: Select-Coefficient-Erase merge method.
-    S: variance-based selection mask (keep top-k by variance)
-    C: energy-based coefficients
-    E: erase minority-sign contributions
-    """
-    # stack to shape [n_tasks, ...]
-    tt = torch.stack(task_tensors, dim=0)
+    '''
+    Merge the task tensors using `sce`. Reference: paper-"https://arxiv.org/abs/2408.07990", github-"https://github.com/arcee-ai/mergekit/blob/main/mergekit/merge_methods/sce.py"
 
-    # --- S step: variance-based sparsification ---
-    mask_s = sce_mask(tt, density, mask_dtype=torch.bool)  # shape [...]
-    mask_s = mask_s.unsqueeze(0)                            # broadcast to [n_tasks, ...]
-    tt = tt * mask_s                                        # prune low-variance
+    Args:
+        task_tensors(`List[torch.Tensor]`):The task tensors to merge.
+        density (`float`):The fraction of values to preserve. Should be in [0,1].
+        majority_sign_method (`str`):
+            The method to use to get the majority sign mask. Should be one of ["total", "frequency"].
 
-    # --- E step prep: majority-sign mask ---
-    maj_mask = calculate_majority_sign_mask(tt, method=majority_sign_method)
-    # maj_mask: [n_tasks, ...], True where task sign == majority sign
+    Returns:
+        `torch.Tensor`: The merged tensor.
+    '''
+    # S: select top-k variance elements in matrices (among different task vectors) v.s. TIES (pruning individually)
+    # C: sum of squares of elements to obtain merging coefficient for each target LLM
+    # E: filter elements with minority directions
+    
+    ## Stack all task tensors into a single tensor of shape [num_tasks, ...]
 
-    # --- C step: compute per-task coefficients ---
-    weights = sce_weight(tt)                                # shape [n_tasks]
-    # reshape to [n_tasks, 1, …] for broadcasting
-    weights = reshape_weight_task_tensors(tt, weights)     
+    ## If density < 1.0, apply a variance-based selection mask to sparsify the merge.
+        ## sce_mask() selects top-k elements (by variance) per dimension across tasks to keep.
+        ## Apply the binary mask across all task tensors.
+    
+    ## Compute a binary mask indicating majority sign agreement per element across task vectors. (reuse)
+    
+    ## Compute task-specific weights with sce_weight()
+    
+    ## Reshape weights to match dimensions of task_tensors for broadcasting.
+    
+    ## Apply the majority sign agreement mask to the task weights. Erase contributions from parameters that violate majority sign consensus.
+    
+    ## Weighted summation of masked task tensors to create a merged task tensor.
 
-    # apply majority-sign erase to weights
-    maj_mask_f = maj_mask.to(weights.dtype)                
-    weights = weights * maj_mask_f                          # zero out minority-sign
+    ## Normalize the merged tensor by the sum of weights at each parameter position. Use clamp(min=1e-6) to avoid division by zero when all weights are erased.
 
-    # --- weighted sum ---
-    merged = torch.sum(tt * weights, dim=0)                
-
-    # --- normalize by sum of weights per position ---
-    weight_sum = torch.sum(weights, dim=0)
-    merged = merged / torch.clamp(weight_sum, min=1e-6)
-
-    return merged
-
-
+    return
+    
 def sce_weight(task_tensors: torch.Tensor) -> torch.Tensor:
-    """
-    Compute energy-based coefficients:
-      weight_i = mean( task_tensors[i]**2 ) / sum_j mean( task_tensors[j]**2 )
-    """
-    # task_tensors: [n_tasks, ...]
-    dims = list(range(1, task_tensors.dim()))
-    energy = torch.mean(task_tensors.pow(2), dim=dims)      # [n_tasks]
-    total   = energy.sum()
-    if total.abs() < 1e-6:
-        # all-zero fallback
-        return torch.ones_like(energy) / energy.shape[0]
-    return energy / total
+	# Implementation of C step
+    
+    # Compute squared magnitude (energy) per task
+    weights = torch.mean(task_tensors**2, dim=list(range(1, task_tensors.dim())))
+	
+    # Sum all weights to normalize
+    weight_sum = torch.sum(weights).item()
+    
+    # Handle edge case: if all task tensors are 0, fallback to uniform weights
+    if abs(weight_sum) < 1e-6:
+        return torch.ones_like(weights) / weights.shape[0]
+	
+    # Normalize to form a probability distribution over tasks
+    return weights / weight_sum
 
-
-def sce_mask(
-    task_tensors: torch.Tensor,
-    density: float,
-    mask_dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    """
-    Build a binary mask (shape [...]) that keeps the top-k fraction
-    of elements by variance across task_tensors.
-    """
-    # shape [n_tasks, ...]
+def sce_mask(task_tensors: torch.Tensor, density: float, mask_dtype: Optional[torch.dtype] = None):
+    # Implementation of S step (sce_mask)
+    
+    # If density is zero, mask out everything 
     if density <= 0:
-        return torch.zeros_like(task_tensors[0], dtype=mask_dtype or torch.bool)
+        return torch.zeros_like(task_tensors, dtype=mask_dtype)
+    
+    # If density is one, keep everything
     if density >= 1:
-        return torch.ones_like (task_tensors[0], dtype=mask_dtype or torch.bool)
-
-    # compute per-position variance
-    var = torch.var(task_tensors, dim=0, unbiased=False)    # [...]
+        return torch.ones_like(task_tensors, dtype=mask_dtype)
+    
+    # Compute variance over the task dimension for each parameter
+    var = torch.var(task_tensors, dim=0, unbiased=False)
+    
+    # Count how many parameters have non-zero variance
     nonzero = torch.count_nonzero(var)
+    
+    # Compute number of parameters to keep based on density
     k = int(nonzero * density)
-    if k <= 0:
-        return torch.zeros_like(var, dtype=mask_dtype or torch.bool)
+    if k == 0:
+        return torch.zeros_like(task_tensors, dtype=mask_dtype)
+    
+    # Select the indices of top-k variances
+    _, indices = torch.topk(var.abs().view(-1), k=k, largest=True)
+    
+    # Build binary mask with 1s in selected indices 
+    mask = torch.zeros_like(var, dtype=mask_dtype)
+    mask.view(-1)[indices] = 1
+    return mask
 
-    flat  = var.abs().view(-1)
-    topk  = torch.topk(flat, k=k, largest=True).indices
-    mask  = torch.zeros_like(flat, dtype=mask_dtype or torch.bool)
-    mask[topk] = True
-    return mask.view(var.shape)
+
 
 
 def dare_linear(task_tensors: List[torch.Tensor], weights: torch.Tensor, density: float) -> torch.Tensor:
